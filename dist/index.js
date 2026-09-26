@@ -1,4 +1,4 @@
-// ../../stewrd-terminal/index.tsx
+// index.tsx
 import { jsx } from "react/jsx-runtime";
 function activate(ctx) {
   ctx.api.log.info("stewrd-terminal plugin activated");

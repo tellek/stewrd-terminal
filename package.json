@@ -1,0 +1,10 @@
+{
+  "name": "stewrd-terminal",
+  "private": true,
+  "scripts": {
+    "build": "esbuild index.tsx --bundle --outfile=dist/index.js --format=esm --platform=browser --target=es2022 --jsx=automatic --sourcemap --external:react --external:react-dom --external:react-dom/* --external:react/* --external:@tauri-apps/api/* --loader:.png=dataurl --loader:.jpg=dataurl --loader:.jpeg=dataurl --loader:.svg=dataurl --loader:.gif=dataurl"
+  },
+  "devDependencies": {
+    "esbuild": "^0.25.0"
+  }
+}
