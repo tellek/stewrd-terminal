@@ -1,0 +1,9 @@
+{
+  "id": "stewrd-terminal",
+  "name": "Stewrd Terminal",
+  "icon": "default",
+  "entry": "dist/index.js",
+  "description": "Blank plugin placeholder for Stewrd Terminal.",
+  "apiVersion": "1",
+  "background": false
+}

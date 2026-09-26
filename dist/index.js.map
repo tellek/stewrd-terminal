@@ -1,0 +1,7 @@
+{
+  "version": 3,
+  "sources": ["../index.tsx"],
+  "sourcesContent": ["/// <reference path=\"../.stewrd/plugin-api.d.ts\" />\nimport type { PluginContext, PluginApi } from \"stewrd-plugin-api\";\n\nexport function activate(ctx: PluginContext) {\n  ctx.api.log.info(\"stewrd-terminal plugin activated\");\n  ctx.api.statusIcon.set(\"idle\");\n}\n\nexport function deactivate() {}\n\nexport function Component({ api }: { api: PluginApi }) {\n  return (\n    <div>\n      <h2>Stewrd Terminal</h2>\n    </div>\n  );\n}\n"],
+  "mappings": ";AAaM;AAVC,SAAS,SAAS,KAAoB;AAC3C,MAAI,IAAI,IAAI,KAAK,kCAAkC;AACnD,MAAI,IAAI,WAAW,IAAI,MAAM;AAC/B;AAEO,SAAS,aAAa;AAAC;AAEvB,SAAS,UAAU,EAAE,IAAI,GAAuB;AACrD,SACE,oBAAC,SACC,8BAAC,QAAG,6BAAe,GACrB;AAEJ;",
+  "names": []
+}
