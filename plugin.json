@@ -3,7 +3,7 @@
   "name": "Stewrd Terminal",
   "icon": "default",
   "entry": "dist/index.js",
-  "description": "Blank plugin placeholder for Stewrd Terminal.",
+  "description": "An embedded interactive terminal backed by the host's PTY commands.",
   "apiVersion": "1",
   "background": false
 }
