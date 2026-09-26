@@ -1,6 +1,6 @@
 {
   "id": "stewrd-terminal",
-  "name": "Stewrd Terminal",
+  "name": "Terminal",
   "icon": "default",
   "entry": "dist/index.js",
   "description": "An embedded interactive terminal backed by the host's PTY commands.",
