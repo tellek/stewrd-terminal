@@ -1,5 +1,5 @@
 // index.tsx
-import { useEffect, useReducer, useRef } from "react";
+import { useEffect, useReducer, useRef, useState } from "react";
 
 // node_modules/@xterm/xterm/lib/xterm.mjs
 var zs = Object.defineProperty;
@@ -9589,7 +9589,9 @@ function toXtermTheme(palette) {
 // index.tsx
 import { jsx, jsxs } from "react/jsx-runtime";
 var QUIET_MS = 700;
-var session = null;
+var NO_PANE_ID = "__no-pane-id__";
+var sessions = /* @__PURE__ */ new Map();
+var pending = /* @__PURE__ */ new Map();
 var activeCtx = null;
 var sessionListeners = /* @__PURE__ */ new Set();
 function injectXtermCssOnce() {
@@ -9612,7 +9614,7 @@ function applyStatus(api, ctx, color) {
 function scheduleQuietCheck(api, ctx, s15) {
   if (s15.quietTimer) clearTimeout(s15.quietTimer);
   s15.quietTimer = setTimeout(() => {
-    if (ctx.signal.aborted || session !== s15) return;
+    if (ctx.signal.aborted || s15.disposed) return;
     const buf = s15.term.buffer.active;
     let lastLine = "";
     for (let i = buf.cursorY; i >= 0; i--) {
@@ -9649,6 +9651,7 @@ async function startSession(api, ctx) {
     hostDiv,
     opened: false,
     exited: false,
+    disposed: false,
     quietTimer: null
   };
   term.parser.registerOscHandler(133, (data) => {
@@ -9705,48 +9708,55 @@ async function teardownSession(s15) {
   if (s15.quietTimer) clearTimeout(s15.quietTimer);
   s15.unsubscribeTheme?.();
   s15.term.dispose();
+  s15.hostDiv.remove();
+  s15.disposed = true;
   await ptyKill(s15.id).catch(() => {
   });
+}
+function getOrCreateSession(api, ctx, paneId) {
+  const existing = sessions.get(paneId);
+  if (existing && !existing.disposed) return Promise.resolve(existing);
+  const inFlight = pending.get(paneId);
+  if (inFlight) return inFlight;
+  const p = startSession(api, ctx).then((s15) => {
+    if (ctx.signal.aborted) {
+      teardownSession(s15);
+      return s15;
+    }
+    sessions.set(paneId, s15);
+    return s15;
+  }).finally(() => {
+    pending.delete(paneId);
+  });
+  pending.set(paneId, p);
+  return p;
 }
 function activate(ctx) {
   injectXtermCssOnce();
   ctx.api.statusIcon.set("idle");
   activeCtx = ctx;
-  startSession(ctx.api, ctx).then((s15) => {
-    if (ctx.signal.aborted) {
-      teardownSession(s15);
-      return;
-    }
-    session = s15;
-    notifySessionChanged();
-  }).catch((err) => {
-    ctx.api.log.error(`terminal activation failed: ${err}`);
-  });
   ctx.onDispose(() => {
     if (activeCtx === ctx) activeCtx = null;
-    const s15 = session;
-    session = null;
-    if (s15) teardownSession(s15);
+    const toTeardown = [...sessions.values()];
+    sessions.clear();
+    pending.clear();
+    toTeardown.forEach((s15) => teardownSession(s15));
   });
 }
 function deactivate() {
 }
-async function restartSession() {
+async function restartSession(paneId) {
   const ctx = activeCtx;
-  if (!ctx) return;
-  const old = session;
-  session = null;
-  notifySessionChanged();
+  if (!ctx) throw new Error("terminal plugin is not active");
+  const old = sessions.get(paneId);
+  sessions.delete(paneId);
   if (old) await teardownSession(old);
-  const s15 = await startSession(ctx.api, ctx);
-  if (ctx.signal.aborted) {
-    await teardownSession(s15);
-    return;
-  }
-  session = s15;
-  notifySessionChanged();
+  return getOrCreateSession(ctx.api, ctx, paneId);
 }
-function Component({ api }) {
+function Component({ api, paneId }) {
+  const key = paneId ?? NO_PANE_ID;
+  const [session, setSession] = useState(null);
+  const mountedRef = useRef(false);
   const containerRef = useRef(null);
   const [, forceUpdate] = useReducer((n) => n + 1, 0);
   useEffect(() => {
@@ -9756,22 +9766,34 @@ function Component({ api }) {
     };
   }, []);
   useEffect(() => {
-    const container = containerRef.current;
-    const s16 = session;
-    if (!container || !s16) return;
-    if (!container.contains(s16.hostDiv)) {
-      container.appendChild(s16.hostDiv);
+    mountedRef.current = true;
+    const ctx = activeCtx;
+    if (ctx) {
+      getOrCreateSession(api, ctx, key).then((s15) => {
+        if (mountedRef.current && !s15.disposed) setSession(s15);
+      }).catch((err) => api.log.error(`terminal activation failed: ${err}`));
     }
-    if (!s16.opened) {
-      s16.term.open(s16.hostDiv);
-      s16.opened = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, [api, key]);
+  useEffect(() => {
+    const container = containerRef.current;
+    const s15 = session;
+    if (!container || !s15) return;
+    if (!container.contains(s15.hostDiv)) {
+      container.appendChild(s15.hostDiv);
+    }
+    if (!s15.opened) {
+      s15.term.open(s15.hostDiv);
+      s15.opened = true;
     } else {
-      s16.fitAddon.fit();
-      s16.term.refresh(0, s16.term.rows - 1);
+      s15.fitAddon.fit();
+      s15.term.refresh(0, s15.term.rows - 1);
     }
     const doFit = () => {
-      s16.fitAddon.fit();
-      ptyResize(s16.id, s16.term.cols, s16.term.rows).catch(() => {
+      s15.fitAddon.fit();
+      ptyResize(s15.id, s15.term.cols, s15.term.rows).catch(() => {
       });
     };
     doFit();
@@ -9782,7 +9804,7 @@ function Component({ api }) {
     });
     ro2.observe(container);
     const onFocusLike = () => {
-      const next = s16.tracker.onFocus();
+      const next = s15.tracker.onFocus();
       try {
         api.statusIcon.set(next);
       } catch {
@@ -9796,10 +9818,20 @@ function Component({ api }) {
       container.removeEventListener("pointerdown", onFocusLike);
     };
   }, [api, session]);
-  const s15 = session;
   return /* @__PURE__ */ jsxs("div", { style: { flex: 1, minHeight: 0, display: "flex", flexDirection: "column" }, children: [
-    s15?.exited && /* @__PURE__ */ jsx(api.ui.Banner, { message: "The Terminal Shell Has Exited", tone: "warning" }),
-    s15?.exited && /* @__PURE__ */ jsx("div", { style: { marginBottom: 8 }, children: /* @__PURE__ */ jsx(api.ui.TextButton, { label: "Restart Terminal", variant: "primary", onClick: () => restartSession() }) }),
+    session?.exited && /* @__PURE__ */ jsx(api.ui.Banner, { message: "The Terminal Shell Has Exited", tone: "warning" }),
+    session?.exited && /* @__PURE__ */ jsx("div", { style: { marginBottom: 8 }, children: /* @__PURE__ */ jsx(
+      api.ui.TextButton,
+      {
+        label: "Restart Terminal",
+        variant: "primary",
+        onClick: () => {
+          restartSession(key).then((s15) => {
+            if (mountedRef.current) setSession(s15);
+          });
+        }
+      }
+    ) }),
     /* @__PURE__ */ jsx("div", { ref: containerRef, style: { flex: 1, minHeight: 0 } })
   ] });
 }

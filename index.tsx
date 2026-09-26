@@ -1,5 +1,5 @@
 /// <reference path="../.stewrd/plugin-api.d.ts" />
-import { useEffect, useReducer, useRef } from "react";
+import { useEffect, useReducer, useRef, useState } from "react";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import xtermCss from "@xterm/xterm/css/xterm.css";
@@ -17,6 +17,7 @@ interface Session {
   hostDiv: HTMLDivElement;
   opened: boolean;
   exited: boolean;
+  disposed: boolean;
   quietTimer: ReturnType<typeof setTimeout> | null;
   unlistenOutput?: () => void;
   unlistenExit?: () => void;
@@ -24,8 +25,19 @@ interface Session {
 }
 
 const QUIET_MS = 700;
+const NO_PANE_ID = "__no-pane-id__";
 
-let session: Session | null = null;
+// Sessions are keyed by pane id (the host-provided `paneId` prop), not by
+// Session.id, so a plugin placed in N panes at once gets N independent
+// shells that each survive that pane's own remounts (tool-switch-away/back,
+// a Settings visit, a pane split/close) instead of fighting over one global
+// terminal. See the plan doc for why sessions are only ever torn down in
+// ctx.onDispose, never on a Component unmount.
+const sessions = new Map<string, Session>();
+// In-flight session creations, keyed by paneId, so a mount racing a
+// restart (or React StrictMode's dev double-invoke) can't spawn two shells
+// for the same pane.
+const pending = new Map<string, Promise<Session>>();
 let activeCtx: PluginContext | null = null;
 const sessionListeners = new Set<() => void>();
 
@@ -53,7 +65,7 @@ function applyStatus(api: PluginApi, ctx: PluginContext, color: HostStatusColor)
 function scheduleQuietCheck(api: PluginApi, ctx: PluginContext, s: Session) {
   if (s.quietTimer) clearTimeout(s.quietTimer);
   s.quietTimer = setTimeout(() => {
-    if (ctx.signal.aborted || session !== s) return;
+    if (ctx.signal.aborted || s.disposed) return;
     const buf = s.term.buffer.active;
     let lastLine = "";
     for (let i = buf.cursorY; i >= 0; i--) {
@@ -95,6 +107,7 @@ async function startSession(api: PluginApi, ctx: PluginContext): Promise<Session
     hostDiv,
     opened: false,
     exited: false,
+    disposed: false,
     quietTimer: null,
   };
 
@@ -159,7 +172,42 @@ async function teardownSession(s: Session) {
   if (s.quietTimer) clearTimeout(s.quietTimer);
   s.unsubscribeTheme?.();
   s.term.dispose();
+  // term.dispose() only clears xterm's own contents from inside hostDiv, it
+  // doesn't remove hostDiv itself - without this, a torn-down session's now
+  // empty hostDiv is left behind in the pane's container.
+  s.hostDiv.remove();
+  s.disposed = true;
   await ptyKill(s.id).catch(() => {});
+}
+
+// Shared by the Component's mount effect and restartSession, so session
+// creation (and the pending/sessions bookkeeping around it) lives in exactly
+// one place. Reuses any existing, non-disposed session for this paneId -
+// deliberately including an already-exited one, since a plain remount
+// (switching tools away and back, or an intervening Settings visit) must not
+// silently discard an exited shell's banner/scrollback out from under the
+// user. Only restartSession is allowed to replace an exited session.
+function getOrCreateSession(api: PluginApi, ctx: PluginContext, paneId: string): Promise<Session> {
+  const existing = sessions.get(paneId);
+  if (existing && !existing.disposed) return Promise.resolve(existing);
+
+  const inFlight = pending.get(paneId);
+  if (inFlight) return inFlight;
+
+  const p = startSession(api, ctx)
+    .then((s) => {
+      if (ctx.signal.aborted) {
+        teardownSession(s);
+        return s;
+      }
+      sessions.set(paneId, s);
+      return s;
+    })
+    .finally(() => {
+      pending.delete(paneId);
+    });
+  pending.set(paneId, p);
+  return p;
 }
 
 export function activate(ctx: PluginContext) {
@@ -167,46 +215,30 @@ export function activate(ctx: PluginContext) {
   ctx.api.statusIcon.set("idle");
   activeCtx = ctx;
 
-  startSession(ctx.api, ctx)
-    .then((s) => {
-      if (ctx.signal.aborted) {
-        teardownSession(s);
-        return;
-      }
-      session = s;
-      notifySessionChanged();
-    })
-    .catch((err) => {
-      ctx.api.log.error(`terminal activation failed: ${err}`);
-    });
-
   ctx.onDispose(() => {
     if (activeCtx === ctx) activeCtx = null;
-    const s = session;
-    session = null;
-    if (s) teardownSession(s);
+    const toTeardown = [...sessions.values()];
+    sessions.clear();
+    pending.clear();
+    toTeardown.forEach((s) => teardownSession(s));
   });
 }
 
 export function deactivate() {}
 
-async function restartSession() {
+async function restartSession(paneId: string): Promise<Session> {
   const ctx = activeCtx;
-  if (!ctx) return;
-  const old = session;
-  session = null;
-  notifySessionChanged();
+  if (!ctx) throw new Error("terminal plugin is not active");
+  const old = sessions.get(paneId);
+  sessions.delete(paneId);
   if (old) await teardownSession(old);
-  const s = await startSession(ctx.api, ctx);
-  if (ctx.signal.aborted) {
-    await teardownSession(s);
-    return;
-  }
-  session = s;
-  notifySessionChanged();
+  return getOrCreateSession(ctx.api, ctx, paneId);
 }
 
-export function Component({ api }: { api: PluginApi }) {
+export function Component({ api, paneId }: { api: PluginApi; paneId?: string }) {
+  const key = paneId ?? NO_PANE_ID;
+  const [session, setSession] = useState<Session | null>(null);
+  const mountedRef = useRef(false);
   const containerRef = useRef<HTMLDivElement | null>(null);
   const [, forceUpdate] = useReducer((n: number) => n + 1, 0);
 
@@ -216,6 +248,25 @@ export function Component({ api }: { api: PluginApi }) {
       sessionListeners.delete(forceUpdate as unknown as () => void);
     };
   }, []);
+
+  useEffect(() => {
+    // Re-armed here (not just at declaration) because React.StrictMode's dev
+    // double-invoke runs this effect, then its cleanup, then this effect
+    // again - without re-arming, mountedRef would stay false forever after
+    // that synthetic remount, permanently blocking setSession in dev builds.
+    mountedRef.current = true;
+    const ctx = activeCtx;
+    if (ctx) {
+      getOrCreateSession(api, ctx, key)
+        .then((s) => {
+          if (mountedRef.current && !s.disposed) setSession(s);
+        })
+        .catch((err) => api.log.error(`terminal activation failed: ${err}`));
+    }
+    return () => {
+      mountedRef.current = false;
+    };
+  }, [api, key]);
 
   useEffect(() => {
     const container = containerRef.current;
@@ -269,13 +320,20 @@ export function Component({ api }: { api: PluginApi }) {
     };
   }, [api, session]);
 
-  const s = session;
   return (
     <div style={{ flex: 1, minHeight: 0, display: "flex", flexDirection: "column" }}>
-      {s?.exited && <api.ui.Banner message="The Terminal Shell Has Exited" tone="warning" />}
-      {s?.exited && (
+      {session?.exited && <api.ui.Banner message="The Terminal Shell Has Exited" tone="warning" />}
+      {session?.exited && (
         <div style={{ marginBottom: 8 }}>
-          <api.ui.TextButton label="Restart Terminal" variant="primary" onClick={() => restartSession()} />
+          <api.ui.TextButton
+            label="Restart Terminal"
+            variant="primary"
+            onClick={() => {
+              restartSession(key).then((s) => {
+                if (mountedRef.current) setSession(s);
+              });
+            }}
+          />
         </div>
       )}
       <div ref={containerRef} style={{ flex: 1, minHeight: 0 }} />
