@@ -1,5 +1,5 @@
 /// <reference path="../.stewrd/plugin-api.d.ts" />
-import React, { useEffect, useRef } from "react";
+import { useEffect, useReducer, useRef } from "react";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import xtermCss from "@xterm/xterm/css/xterm.css";
@@ -208,7 +208,7 @@ async function restartSession() {
 
 export function Component({ api }: { api: PluginApi }) {
   const containerRef = useRef<HTMLDivElement | null>(null);
-  const [, forceUpdate] = React.useReducer((n: number) => n + 1, 0);
+  const [, forceUpdate] = useReducer((n: number) => n + 1, 0);
 
   useEffect(() => {
     sessionListeners.add(forceUpdate as unknown as () => void);
@@ -240,7 +240,15 @@ export function Component({ api }: { api: PluginApi }) {
     };
     doFit();
 
-    const ro = new ResizeObserver(() => doFit());
+    // Deferred to the next frame: calling doFit() synchronously from inside
+    // the ResizeObserver callback resizes the observed element again in the
+    // same pass, which trips the browser's benign-but-noisy "ResizeObserver
+    // loop completed with undelivered notifications" warning.
+    let rafId = 0;
+    const ro = new ResizeObserver(() => {
+      cancelAnimationFrame(rafId);
+      rafId = requestAnimationFrame(doFit);
+    });
     ro.observe(container);
 
     const onFocusLike = () => {
@@ -256,6 +264,7 @@ export function Component({ api }: { api: PluginApi }) {
 
     return () => {
       ro.disconnect();
+      cancelAnimationFrame(rafId);
       container.removeEventListener("pointerdown", onFocusLike);
     };
   }, [api, session]);

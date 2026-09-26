@@ -1,5 +1,5 @@
 // index.tsx
-import React, { useEffect, useRef } from "react";
+import { useEffect, useReducer, useRef } from "react";
 
 // node_modules/@xterm/xterm/lib/xterm.mjs
 var zs = Object.defineProperty;
@@ -9748,7 +9748,7 @@ async function restartSession() {
 }
 function Component({ api }) {
   const containerRef = useRef(null);
-  const [, forceUpdate] = React.useReducer((n) => n + 1, 0);
+  const [, forceUpdate] = useReducer((n) => n + 1, 0);
   useEffect(() => {
     sessionListeners.add(forceUpdate);
     return () => {
@@ -9775,7 +9775,11 @@ function Component({ api }) {
       });
     };
     doFit();
-    const ro2 = new ResizeObserver(() => doFit());
+    let rafId = 0;
+    const ro2 = new ResizeObserver(() => {
+      cancelAnimationFrame(rafId);
+      rafId = requestAnimationFrame(doFit);
+    });
     ro2.observe(container);
     const onFocusLike = () => {
       const next = s16.tracker.onFocus();
@@ -9788,6 +9792,7 @@ function Component({ api }) {
     onFocusLike();
     return () => {
       ro2.disconnect();
+      cancelAnimationFrame(rafId);
       container.removeEventListener("pointerdown", onFocusLike);
     };
   }, [api, session]);
