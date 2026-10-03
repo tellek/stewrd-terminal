@@ -2,7 +2,7 @@
   "name": "stewrd-terminal",
   "private": true,
   "scripts": {
-    "build": "esbuild index.tsx --bundle --outfile=dist/index.js --format=esm --platform=browser --target=es2022 --jsx=automatic --sourcemap --external:react --external:react-dom --external:react-dom/* --external:react/* --external:@tauri-apps/api/* --loader:.png=dataurl --loader:.jpg=dataurl --loader:.jpeg=dataurl --loader:.svg=dataurl --loader:.gif=dataurl --loader:.css=text",
+    "build": "esbuild index.tsx --bundle --outfile=dist/index.js --format=esm --platform=browser --target=es2022 --jsx=automatic --minify --external:react --external:react-dom --external:react-dom/* --external:react/* --external:@tauri-apps/api/* --loader:.png=dataurl --loader:.jpg=dataurl --loader:.jpeg=dataurl --loader:.svg=dataurl --loader:.gif=dataurl --loader:.css=text",
     "test": "vitest run"
   },
   "devDependencies": {
@@ -11,6 +11,7 @@
   },
   "dependencies": {
     "@xterm/addon-fit": "^0.11.0",
+    "@xterm/addon-webgl": "0.19.0",
     "@xterm/xterm": "^6.0.0"
   }
 }

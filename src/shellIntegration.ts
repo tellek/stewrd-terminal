@@ -50,14 +50,20 @@ export interface ShellLaunch {
   args: string[];
 }
 
-export async function pickShell(api: PluginApi): Promise<ShellLaunch> {
-  let program = "powershell.exe";
-  try {
-    const result = await api.shell.exec("where.exe", ["pwsh"]);
-    if (result.code === 0) program = "pwsh";
-  } catch {
-    // fall back to powershell.exe
-  }
-  const encoded = encodeCommand(buildScript());
-  return { program, args: ["-NoLogo", "-NoExit", "-EncodedCommand", encoded] };
+// Cached as a promise so panes opening at the same time share one where.exe.
+let shellPromise: Promise<ShellLaunch> | null = null;
+
+export function pickShell(api: PluginApi): Promise<ShellLaunch> {
+  shellPromise ??= (async () => {
+    let program = "powershell.exe";
+    try {
+      const result = await api.shell.exec("where.exe", ["pwsh"]);
+      if (result.code === 0) program = "pwsh";
+    } catch {
+      // fall back to powershell.exe
+    }
+    const encoded = encodeCommand(buildScript());
+    return { program, args: ["-NoLogo", "-NoExit", "-EncodedCommand", encoded] };
+  })();
+  return shellPromise;
 }

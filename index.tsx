@@ -2,11 +2,13 @@
 import { useEffect, useReducer, useRef, useState } from "react";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
+import { WebglAddon } from "@xterm/addon-webgl";
 import xtermCss from "@xterm/xterm/css/xterm.css";
 import type { PluginContext, PluginApi, StatusColor as HostStatusColor } from "stewrd-plugin-api";
 import { ptySpawn, ptyWrite, ptyResize, ptyKill, onPtyOutput, onPtyExit } from "./src/pty";
 import { pickShell } from "./src/shellIntegration";
 import { StatusTracker } from "./src/statusTracker";
+import { createQuietTimer, type QuietTimer } from "./src/quietTimer";
 import { toXtermTheme } from "./src/xtermTheme";
 
 interface Session {
@@ -18,7 +20,11 @@ interface Session {
   opened: boolean;
   exited: boolean;
   disposed: boolean;
-  quietTimer: ReturnType<typeof setTimeout> | null;
+  quietTimer: QuietTimer;
+  // Last size actually sent to the PTY (ptySpawn starts at 80x24), so resizes
+  // are deduped against what the shell knows, not against xterm's own size.
+  ptyCols: number;
+  ptyRows: number;
   unlistenOutput?: () => void;
   unlistenExit?: () => void;
   unsubscribeTheme?: () => void;
@@ -56,29 +62,22 @@ function notifySessionChanged() {
 function applyStatus(api: PluginApi, ctx: PluginContext, color: HostStatusColor) {
   if (ctx.signal.aborted) return;
   try {
-    api.statusIcon.set(color);
+    // The icon is plugin-wide (shared by every pane), so dedupe against the
+    // host's current value; this runs on every output chunk.
+    if (api.statusIcon.get() !== color) api.statusIcon.set(color);
   } catch {
     // thrown after hot-reload/deactivation - safe to ignore
   }
 }
 
-function scheduleQuietCheck(api: PluginApi, ctx: PluginContext, s: Session) {
-  if (s.quietTimer) clearTimeout(s.quietTimer);
-  s.quietTimer = setTimeout(() => {
-    if (ctx.signal.aborted || s.disposed) return;
-    const buf = s.term.buffer.active;
-    let lastLine = "";
-    for (let i = buf.cursorY; i >= 0; i--) {
-      const line = buf.getLine(i);
-      const text = line ? line.translateToString(true) : "";
-      if (text.trim()) {
-        lastLine = text;
-        break;
-      }
-    }
-    const next = s.tracker.onQuiet(lastLine);
-    applyStatus(api, ctx, next);
-  }, QUIET_MS);
+function lastNonBlankLine(s: Session): string {
+  const buf = s.term.buffer.active;
+  for (let i = buf.cursorY; i >= 0; i--) {
+    const line = buf.getLine(i);
+    const text = line ? line.translateToString(true) : "";
+    if (text.trim()) return text;
+  }
+  return "";
 }
 
 // data is the OSC 133 payload, e.g. "D", "D;0", "D;1", or "A" (not a done marker).
@@ -108,7 +107,12 @@ async function startSession(api: PluginApi, ctx: PluginContext): Promise<Session
     opened: false,
     exited: false,
     disposed: false,
-    quietTimer: null,
+    quietTimer: createQuietTimer(QUIET_MS, () => {
+      if (ctx.signal.aborted || s.disposed) return;
+      applyStatus(api, ctx, tracker.onQuiet(lastNonBlankLine(s)));
+    }),
+    ptyCols: 80,
+    ptyRows: 24,
   };
 
   term.parser.registerOscHandler(133, (data: string) => {
@@ -126,31 +130,33 @@ async function startSession(api: PluginApi, ctx: PluginContext): Promise<Session
     ptyWrite(s.id, data).catch((err) => api.log.error(`pty write failed: ${err}`));
   });
 
-  const unlistenOutput = await onPtyOutput(s.id, (chunk) => {
-    if (ctx.signal.aborted) return;
-    term.write(chunk);
-    const next = tracker.onOutput();
-    applyStatus(api, ctx, next);
-    scheduleQuietCheck(api, ctx, s);
-  });
-  if (ctx.signal.aborted) {
-    unlistenOutput();
+  const [outputRes, exitRes, shellRes] = await Promise.allSettled([
+    onPtyOutput(s.id, (chunk) => {
+      if (ctx.signal.aborted) return;
+      term.write(chunk);
+      applyStatus(api, ctx, tracker.onOutput());
+      s.quietTimer.touch();
+    }),
+    onPtyExit(s.id, (code) => {
+      s.exited = true;
+      api.log.info(`terminal shell exited (code ${code})`);
+      notifySessionChanged();
+    }),
+    pickShell(api),
+  ]);
+  const unlistenOutput = outputRes.status === "fulfilled" ? outputRes.value : undefined;
+  const unlistenExit = exitRes.status === "fulfilled" ? exitRes.value : undefined;
+  const failure = [outputRes, exitRes, shellRes].find((r) => r.status === "rejected");
+  if (failure || ctx.signal.aborted) {
+    unlistenOutput?.();
+    unlistenExit?.();
+    if (failure) throw (failure as PromiseRejectedResult).reason;
     return s;
   }
   s.unlistenOutput = unlistenOutput;
-
-  const unlistenExit = await onPtyExit(s.id, (code) => {
-    s.exited = true;
-    api.log.info(`terminal shell exited (code ${code})`);
-    notifySessionChanged();
-  });
-  if (ctx.signal.aborted) {
-    unlistenExit();
-    return s;
-  }
   s.unlistenExit = unlistenExit;
 
-  const shell = await pickShell(api);
+  const shell = (shellRes as PromiseFulfilledResult<Awaited<ReturnType<typeof pickShell>>>).value;
   try {
     await ptySpawn({ id: s.id, program: shell.program, args: shell.args, cols: 80, rows: 24 });
   } catch (err) {
@@ -169,7 +175,7 @@ async function startSession(api: PluginApi, ctx: PluginContext): Promise<Session
 async function teardownSession(s: Session) {
   s.unlistenOutput?.();
   s.unlistenExit?.();
-  if (s.quietTimer) clearTimeout(s.quietTimer);
+  s.quietTimer.cancel();
   s.unsubscribeTheme?.();
   s.term.dispose();
   // term.dispose() only clears xterm's own contents from inside hostDiv, it
@@ -280,6 +286,15 @@ export function Component({ api, paneId }: { api: PluginApi; paneId?: string }) 
     if (!s.opened) {
       s.term.open(s.hostDiv);
       s.opened = true;
+      // WebGL is far faster than the DOM renderer for heavy output; if it
+      // can't load (no WebGL2, GPU blocklist) xterm keeps the DOM renderer.
+      try {
+        const webgl = new WebglAddon();
+        webgl.onContextLoss(() => webgl.dispose());
+        s.term.loadAddon(webgl);
+      } catch {
+        // fall back to the DOM renderer
+      }
     } else {
       s.fitAddon.fit();
       s.term.refresh(0, s.term.rows - 1);
@@ -287,7 +302,11 @@ export function Component({ api, paneId }: { api: PluginApi; paneId?: string }) 
 
     const doFit = () => {
       s.fitAddon.fit();
-      ptyResize(s.id, s.term.cols, s.term.rows).catch(() => {});
+      const { cols, rows } = s.term;
+      if (cols === s.ptyCols && rows === s.ptyRows) return;
+      s.ptyCols = cols;
+      s.ptyRows = rows;
+      ptyResize(s.id, cols, rows).catch(() => {});
     };
     doFit();
 
@@ -303,12 +322,7 @@ export function Component({ api, paneId }: { api: PluginApi; paneId?: string }) 
     ro.observe(container);
 
     const onFocusLike = () => {
-      const next = s.tracker.onFocus();
-      try {
-        api.statusIcon.set(next);
-      } catch {
-        // thrown after hot-reload/deactivation - safe to ignore
-      }
+      if (activeCtx) applyStatus(api, activeCtx, s.tracker.onFocus());
     };
     container.addEventListener("pointerdown", onFocusLike);
     onFocusLike();
