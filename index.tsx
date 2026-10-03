@@ -7,7 +7,7 @@ import xtermCss from "@xterm/xterm/css/xterm.css";
 import type { PluginContext, PluginApi, StatusColor as HostStatusColor } from "stewrd-plugin-api";
 import { ptySpawn, ptyWrite, ptyResize, ptyKill, onPtyOutput, onPtyExit } from "./src/pty";
 import { pickShell } from "./src/shellIntegration";
-import { StatusTracker } from "./src/statusTracker";
+import { StatusTracker, SUCCESS_MS, worstStatus, type StatusColor } from "./src/statusTracker";
 import { createQuietTimer, type QuietTimer } from "./src/quietTimer";
 import { toXtermTheme } from "./src/xtermTheme";
 
@@ -20,6 +20,12 @@ interface Session {
   opened: boolean;
   exited: boolean;
   disposed: boolean;
+  // True while the plugin is mounted in a pane; the success dot only counts
+  // down while this and the window both have focus.
+  visible: boolean;
+  // Last state rendered by the in-pane dot, to re-render only on change.
+  shownState: StatusColor;
+  successTimer: ReturnType<typeof setTimeout> | null;
   quietTimer: QuietTimer;
   // Last size actually sent to the PTY (ptySpawn starts at 80x24), so resizes
   // are deduped against what the shell knows, not against xterm's own size.
@@ -59,14 +65,44 @@ function notifySessionChanged() {
   sessionListeners.forEach((fn) => fn());
 }
 
-function applyStatus(api: PluginApi, ctx: PluginContext, color: HostStatusColor) {
+// The sidebar icon is plugin-wide, so it shows the worst state across every
+// pane's session (error > warning > in-progress > success > idle).
+function applyStatus(api: PluginApi, ctx: PluginContext) {
   if (ctx.signal.aborted) return;
+  const color = worstStatus([...sessions.values()].map((x) => x.tracker.getState()));
   try {
-    // The icon is plugin-wide (shared by every pane), so dedupe against the
-    // host's current value; this runs on every output chunk.
+    // Dedupe against the host's current value; this runs on every output chunk.
     if (api.statusIcon.get() !== color) api.statusIcon.set(color);
   } catch {
     // thrown after hot-reload/deactivation - safe to ignore
+  }
+}
+
+// success lingers SUCCESS_MS, counted only while the app and this plugin are
+// focused, so a success finished in the background stays until the user returns.
+function syncSuccessTimer(api: PluginApi, ctx: PluginContext, s: Session) {
+  const counting = s.tracker.getState() === "success" && s.visible && document.hasFocus();
+  if (!counting) {
+    if (s.successTimer) clearTimeout(s.successTimer);
+    s.successTimer = null;
+    return;
+  }
+  if (s.successTimer) return;
+  s.successTimer = setTimeout(() => {
+    s.successTimer = null;
+    if (ctx.signal.aborted || s.disposed) return;
+    s.tracker.onSuccessElapsed();
+    updateStatus(api, ctx, s);
+  }, SUCCESS_MS);
+}
+
+function updateStatus(api: PluginApi, ctx: PluginContext, s: Session) {
+  syncSuccessTimer(api, ctx, s);
+  applyStatus(api, ctx);
+  const state = s.tracker.getState();
+  if (state !== s.shownState) {
+    s.shownState = state;
+    notifySessionChanged();
   }
 }
 
@@ -107,9 +143,13 @@ async function startSession(api: PluginApi, ctx: PluginContext): Promise<Session
     opened: false,
     exited: false,
     disposed: false,
+    visible: false,
+    shownState: "idle",
+    successTimer: null,
     quietTimer: createQuietTimer(QUIET_MS, () => {
       if (ctx.signal.aborted || s.disposed) return;
-      applyStatus(api, ctx, tracker.onQuiet(lastNonBlankLine(s)));
+      tracker.onQuiet(lastNonBlankLine(s));
+      updateStatus(api, ctx, s);
     }),
     ptyCols: 80,
     ptyRows: 24,
@@ -118,15 +158,15 @@ async function startSession(api: PluginApi, ctx: PluginContext): Promise<Session
   term.parser.registerOscHandler(133, (data: string) => {
     const exitFlag = parseCommandDoneMarker(data);
     if (exitFlag !== undefined) {
-      const next = tracker.onCommandDone(exitFlag);
-      applyStatus(api, ctx, next);
+      tracker.onCommandDone(exitFlag);
+      updateStatus(api, ctx, s);
     }
     return true;
   });
 
   term.onData((data) => {
-    const next = tracker.onInput(data);
-    applyStatus(api, ctx, next);
+    tracker.onInput(data);
+    updateStatus(api, ctx, s);
     ptyWrite(s.id, data).catch((err) => api.log.error(`pty write failed: ${err}`));
   });
 
@@ -134,7 +174,8 @@ async function startSession(api: PluginApi, ctx: PluginContext): Promise<Session
     onPtyOutput(s.id, (chunk) => {
       if (ctx.signal.aborted) return;
       term.write(chunk);
-      applyStatus(api, ctx, tracker.onOutput());
+      tracker.onOutput();
+      updateStatus(api, ctx, s);
       s.quietTimer.touch();
     }),
     onPtyExit(s.id, (code) => {
@@ -162,7 +203,7 @@ async function startSession(api: PluginApi, ctx: PluginContext): Promise<Session
   } catch (err) {
     api.log.error(`failed to spawn terminal: ${err}`);
     s.exited = true;
-    applyStatus(api, ctx, "error");
+    tracker.onFatal();
   }
 
   s.unsubscribeTheme = api.theme.subscribe((palette) => {
@@ -176,6 +217,7 @@ async function teardownSession(s: Session) {
   s.unlistenOutput?.();
   s.unlistenExit?.();
   s.quietTimer.cancel();
+  if (s.successTimer) clearTimeout(s.successTimer);
   s.unsubscribeTheme?.();
   s.term.dispose();
   // term.dispose() only clears xterm's own contents from inside hostDiv, it
@@ -207,6 +249,7 @@ function getOrCreateSession(api: PluginApi, ctx: PluginContext, paneId: string):
         return s;
       }
       sessions.set(paneId, s);
+      applyStatus(api, ctx);
       return s;
     })
     .finally(() => {
@@ -238,6 +281,7 @@ async function restartSession(paneId: string): Promise<Session> {
   const old = sessions.get(paneId);
   sessions.delete(paneId);
   if (old) await teardownSession(old);
+  applyStatus(ctx.api, ctx);
   return getOrCreateSession(ctx.api, ctx, paneId);
 }
 
@@ -321,13 +365,27 @@ export function Component({ api, paneId }: { api: PluginApi; paneId?: string }) 
     });
     ro.observe(container);
 
+    // Focus acknowledges an error and (re)starts the success countdown; blur
+    // pauses the countdown so a success finished in the background stays put.
+    s.visible = true;
     const onFocusLike = () => {
-      if (activeCtx) applyStatus(api, activeCtx, s.tracker.onFocus());
+      if (!activeCtx) return;
+      s.tracker.onFocus();
+      updateStatus(api, activeCtx, s);
+    };
+    const onWindowFocusChange = () => {
+      if (activeCtx) syncSuccessTimer(api, activeCtx, s);
     };
     container.addEventListener("pointerdown", onFocusLike);
+    window.addEventListener("focus", onFocusLike);
+    window.addEventListener("blur", onWindowFocusChange);
     onFocusLike();
 
     return () => {
+      s.visible = false;
+      if (activeCtx) syncSuccessTimer(api, activeCtx, s);
+      window.removeEventListener("focus", onFocusLike);
+      window.removeEventListener("blur", onWindowFocusChange);
       ro.disconnect();
       cancelAnimationFrame(rafId);
       container.removeEventListener("pointerdown", onFocusLike);
@@ -348,6 +406,11 @@ export function Component({ api, paneId }: { api: PluginApi; paneId?: string }) 
               });
             }}
           />
+        </div>
+      )}
+      {session && (
+        <div style={{ marginBottom: 4, lineHeight: 0 }}>
+          <api.ui.StatusDot color={session.tracker.getState()} />
         </div>
       )}
       <div ref={containerRef} style={{ flex: 1, minHeight: 0 }} />

@@ -64,10 +64,35 @@ export class StatusTracker {
     return this.current;
   }
 
+  // Focus acknowledges an error; success is NOT cleared here, it lingers for
+  // SUCCESS_MS of focused time (see onSuccessElapsed).
   onFocus(): StatusColor {
-    if (this.current === "success" || this.current === "error") {
+    if (this.current === "error") {
       this.current = "idle";
     }
     return this.current;
   }
+
+  // The success dot is shown for SUCCESS_MS while the app and plugin have focus.
+  onSuccessElapsed(): StatusColor {
+    if (this.current === "success") {
+      this.current = "idle";
+    }
+    return this.current;
+  }
+
+  // A failure outside the command flow (e.g. the shell failed to spawn).
+  onFatal(): StatusColor {
+    this.current = "error";
+    return this.current;
+  }
+}
+
+export const SUCCESS_MS = 3000;
+
+// Highest-priority color wins: error > warning > in-progress > success > idle.
+const PRIORITY: StatusColor[] = ["idle", "success", "in-progress", "warning", "error"];
+
+export function worstStatus(states: StatusColor[]): StatusColor {
+  return states.reduce<StatusColor>((w, s) => (PRIORITY.indexOf(s) > PRIORITY.indexOf(w) ? s : w), "idle");
 }

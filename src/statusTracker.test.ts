@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { StatusTracker, looksLikeQuestion } from "./statusTracker";
+import { StatusTracker, looksLikeQuestion, worstStatus } from "./statusTracker";
 
 describe("looksLikeQuestion", () => {
   it("detects question marks, y/n prompts, trailing colons, password/key prompts", () => {
@@ -94,11 +94,11 @@ describe("StatusTracker", () => {
     expect(t.onQuiet("still working...")).toBe("in-progress");
   });
 
-  it("onFocus clears success/error to idle but leaves in-progress/warning alone", () => {
+  it("onFocus clears error to idle but leaves success/in-progress/warning alone", () => {
     const success = new StatusTracker();
     success.onInput("\r");
     success.onCommandDone(0);
-    expect(success.onFocus()).toBe("idle");
+    expect(success.onFocus()).toBe("success");
 
     const error = new StatusTracker();
     error.onInput("\r");
@@ -113,5 +113,30 @@ describe("StatusTracker", () => {
     warning.onInput("\r");
     warning.onQuiet("Continue?");
     expect(warning.onFocus()).toBe("warning");
+  });
+
+  it("onSuccessElapsed returns success to idle and leaves other states alone", () => {
+    const success = new StatusTracker();
+    success.onInput("\r");
+    success.onCommandDone(0);
+    expect(success.onSuccessElapsed()).toBe("idle");
+
+    const running = new StatusTracker();
+    running.onInput("\r");
+    expect(running.onSuccessElapsed()).toBe("in-progress");
+  });
+
+  it("onFatal goes error", () => {
+    expect(new StatusTracker().onFatal()).toBe("error");
+  });
+});
+
+describe("worstStatus", () => {
+  it("picks error > warning > in-progress > success > idle", () => {
+    expect(worstStatus([])).toBe("idle");
+    expect(worstStatus(["idle", "success"])).toBe("success");
+    expect(worstStatus(["success", "in-progress"])).toBe("in-progress");
+    expect(worstStatus(["in-progress", "warning", "success"])).toBe("warning");
+    expect(worstStatus(["warning", "error", "idle"])).toBe("error");
   });
 });
