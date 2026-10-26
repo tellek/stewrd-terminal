@@ -408,11 +408,6 @@ export function Component({ api, paneId }: { api: PluginApi; paneId?: string }) 
           />
         </div>
       )}
-      {session && (
-        <div style={{ marginBottom: 4, lineHeight: 0 }}>
-          <api.ui.StatusDot color={session.tracker.getState()} />
-        </div>
-      )}
       <div ref={containerRef} style={{ flex: 1, minHeight: 0 }} />
     </div>
   );

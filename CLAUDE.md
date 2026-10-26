@@ -6,7 +6,7 @@
 
 ## Status Dot and Sidebar Icon Color Rules
 
-- Each plugin shows a dot somewhere within it (`api.ui.StatusDot`) whose color reflects what the plugin is doing, using the palette `status.*` colors:
+- Each plugin tracks a status (no dot is rendered inside the plugin area, status is relayed only via the sidebar icon) whose color reflects what the plugin is doing, using the palette `status.*` colors:
     - Idle: `status.idle`
     - Doing something (saving, processing, etc.): `status.in-progress`
     - Successfully completed an action: `status.success` for 3 seconds, counted only while the app AND the plugin have focus. If the user is in another app or another plugin, it stays `status.success` until they return, then changes 3 seconds later
