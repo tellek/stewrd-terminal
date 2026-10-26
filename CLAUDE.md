@@ -22,6 +22,7 @@
     2. If it was a code change: Extecute all tests, fix any that are broken by fixing the related code, not the test(unless the test code truly is broken)
     3. Commit and push directly to main branch (do **NOT** create a pull request)
     4. If it was a code change: Execute ./build-release.bat yourself — do not ask Topher to run it
+- When told to create a new GitHub release: bump `"version"` in `settings.json` by the specified part of major.minor.patch (patch by default), commit any uncommitted changes, push main, run ./build-release.bat, zip the plugin folder (`plugin.json`, `settings.json`, `icon.png`, built `dist/`) so it installs via Settings > Plugins > Add plugin, create and push a `v<version>` tag, then `gh release create` on the repo with the zip attached
 - ARCHITECTURE.md is a good source to grep for details around this project this plugin will run in but shouldnt be necessary to load into context
 - build-release.bat is intended as a local development tool to quickly move the plugin over to the folder where I run stewrd so the plugin may be tested by me in the app. Claude should run it directly after every code change, not hand it back to Topher.
 
