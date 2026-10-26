@@ -1,6 +1,6 @@
 # Stewrd Terminal
 
-An embedded interactive terminal (pwsh, falling back to powershell.exe) backed by the host's PTY commands (`pty_spawn`/`pty_write`/`pty_resize`/`pty_kill`). Requires a Stewrd build that includes those PTY commands.
+An embedded interactive terminal (pwsh, falling back to powershell.exe) backed by the host's PTY commands (`pty_spawn`/`pty_write`/`pty_resize`/`pty_kill`). Requires a Stewrd build that includes those PTY commands. On a host that also has `pty_spawn_v2`/`pty_ack` it streams output over a flow-controlled binary channel (noticeably snappier under heavy output and Ctrl-C); on older hosts it falls back to the event-based path automatically.
 
 Each pane shows a status dot, and the sidebar icon shows the worst state across all panes (`error` > `warning` > `in-progress` > `success` > `idle`):
 - `in-progress` while a command is running

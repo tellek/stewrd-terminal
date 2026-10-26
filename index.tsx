@@ -5,8 +5,11 @@ import { FitAddon } from "@xterm/addon-fit";
 import { WebglAddon } from "@xterm/addon-webgl";
 import xtermCss from "@xterm/xterm/css/xterm.css";
 import type { PluginContext, PluginApi, StatusColor as HostStatusColor } from "stewrd-plugin-api";
-import { ptySpawn, ptyWrite, ptyResize, ptyKill, onPtyOutput, onPtyExit } from "./src/pty";
-import { pickShell } from "./src/shellIntegration";
+import { ptySpawn, ptyWrite, ptyResize, ptyKill, ptyAck, onPtyOutput, onPtyExit } from "./src/pty";
+import { pickShell, type ShellLaunch } from "./src/shellIntegration";
+import { createAckBatcher, type AckBatcher } from "./src/ackBatcher";
+import { createInputCoalescer, type InputCoalescer } from "./src/inputCoalescer";
+import { parseWindowsBuild } from "./src/hostCompat";
 import { StatusTracker, SUCCESS_MS, worstStatus, type StatusColor } from "./src/statusTracker";
 import { createQuietTimer, type QuietTimer } from "./src/quietTimer";
 import { toXtermTheme } from "./src/xtermTheme";
@@ -31,6 +34,14 @@ interface Session {
   // are deduped against what the shell knows, not against xterm's own size.
   ptyCols: number;
   ptyRows: number;
+  // The shell is spawned on the first fit (not at creation) so it starts at the
+  // pane's real size instead of 80x24 and repaints its prompt only once.
+  shell: ShellLaunch;
+  spawnPromise?: Promise<void>;
+  onOutput: (chunk: string | Uint8Array) => void;
+  acks: AckBatcher;
+  input: InputCoalescer;
+  webglRetries: number;
   unlistenOutput?: () => void;
   unlistenExit?: () => void;
   unsubscribeTheme?: () => void;
@@ -124,8 +135,23 @@ function parseCommandDoneMarker(data: string): 0 | 1 | null | undefined {
   return undefined;
 }
 
+// Resolved once; xterm's ConPTY-aware resize/reflow handling needs the OS build
+// number, and a wrong or low value would disable reflow, so leave it unset if
+// it can't be determined.
+let windowsBuildPromise: Promise<number | undefined> | null = null;
+function getWindowsBuild(api: PluginApi): Promise<number | undefined> {
+  windowsBuildPromise ??= api.shell
+    .exec("cmd", ["/c", "ver"])
+    .then((r) => parseWindowsBuild(r.stdout))
+    .catch(() => undefined);
+  return windowsBuildPromise;
+}
+
 async function startSession(api: PluginApi, ctx: PluginContext): Promise<Session> {
   const term = new Terminal({ theme: toXtermTheme(api.theme.palette), cursorBlink: true, fontSize: 13 });
+  getWindowsBuild(api).then((buildNumber) => {
+    if (buildNumber) term.options.windowsPty = { backend: "conpty", buildNumber };
+  });
   const fitAddon = new FitAddon();
   term.loadAddon(fitAddon);
 
@@ -153,6 +179,18 @@ async function startSession(api: PluginApi, ctx: PluginContext): Promise<Session
     }),
     ptyCols: 80,
     ptyRows: 24,
+    shell: undefined as unknown as ShellLaunch, // set below, before the session is returned
+    onOutput: () => {}, // replaced below
+    acks: createAckBatcher((n) => {
+      if (!s.disposed) ptyAck(s.id, n).catch(() => {});
+    }),
+    // Waits for the spawn so early input (incl. xterm's cursor-report reply)
+    // can't hit an unknown session id.
+    input: createInputCoalescer(
+      (data) => (s.spawnPromise ?? Promise.resolve()).then(() => ptyWrite(s.id, data)),
+      (err) => api.log.error(`pty write failed: ${err}`),
+    ),
+    webglRetries: 0,
   };
 
   term.parser.registerOscHandler(133, (data: string) => {
@@ -165,19 +203,28 @@ async function startSession(api: PluginApi, ctx: PluginContext): Promise<Session
   });
 
   term.onData((data) => {
-    tracker.onInput(data);
-    updateStatus(api, ctx, s);
-    ptyWrite(s.id, data).catch((err) => api.log.error(`pty write failed: ${err}`));
+    s.input.push(data);
+    // onInput only reacts to Enter, so skip the status work for other keys.
+    if (data.includes("\r") || data.includes("\n")) {
+      tracker.onInput(data);
+      updateStatus(api, ctx, s);
+    }
   });
 
+  // Binary chunks come from the flow-controlled channel (pty_spawn_v2); string
+  // chunks from the "pty-output" event on a host that predates it.
+  const onOutput = (chunk: string | Uint8Array) => {
+    if (ctx.signal.aborted || s.disposed) return;
+    if (typeof chunk === "string") term.write(chunk);
+    else term.write(chunk, s.acks.track(chunk.byteLength));
+    const before = tracker.getState();
+    if (tracker.onOutput() !== before) updateStatus(api, ctx, s);
+    s.quietTimer.touch();
+  };
+  s.onOutput = onOutput;
+
   const [outputRes, exitRes, shellRes] = await Promise.allSettled([
-    onPtyOutput(s.id, (chunk) => {
-      if (ctx.signal.aborted) return;
-      term.write(chunk);
-      tracker.onOutput();
-      updateStatus(api, ctx, s);
-      s.quietTimer.touch();
-    }),
+    onPtyOutput(s.id, onOutput),
     onPtyExit(s.id, (code) => {
       s.exited = true;
       api.log.info(`terminal shell exited (code ${code})`);
@@ -197,14 +244,7 @@ async function startSession(api: PluginApi, ctx: PluginContext): Promise<Session
   s.unlistenOutput = unlistenOutput;
   s.unlistenExit = unlistenExit;
 
-  const shell = (shellRes as PromiseFulfilledResult<Awaited<ReturnType<typeof pickShell>>>).value;
-  try {
-    await ptySpawn({ id: s.id, program: shell.program, args: shell.args, cols: 80, rows: 24 });
-  } catch (err) {
-    api.log.error(`failed to spawn terminal: ${err}`);
-    s.exited = true;
-    tracker.onFatal();
-  }
+  s.shell = (shellRes as PromiseFulfilledResult<ShellLaunch>).value;
 
   s.unsubscribeTheme = api.theme.subscribe((palette) => {
     term.options.theme = toXtermTheme(palette);
@@ -213,7 +253,50 @@ async function startSession(api: PluginApi, ctx: PluginContext): Promise<Session
   return s;
 }
 
+// WebGL is far faster than the DOM renderer for heavy output; if it can't load
+// (no WebGL2, GPU blocklist) xterm keeps the DOM renderer. After a GPU context
+// loss it is recreated, at most twice, since each pane holds its own context.
+function attachWebgl(s: Session) {
+  try {
+    const webgl = new WebglAddon();
+    webgl.onContextLoss(() => {
+      webgl.dispose();
+      if (s.disposed || s.webglRetries >= 2) return;
+      s.webglRetries++;
+      setTimeout(() => {
+        if (!s.disposed) attachWebgl(s);
+      }, 1000 * s.webglRetries);
+    });
+    s.term.loadAddon(webgl);
+  } catch {
+    // fall back to the DOM renderer
+  }
+}
+
+// Spawns the shell once, at the term's current (fitted) size. Idempotent, and a
+// no-op after teardown so a late first fit can't start a shell nobody kills.
+function spawnSession(api: PluginApi, ctx: PluginContext, s: Session) {
+  if (s.spawnPromise || s.disposed || ctx.signal.aborted) return;
+  s.ptyCols = s.term.cols;
+  s.ptyRows = s.term.rows;
+  s.spawnPromise = ptySpawn(
+    { id: s.id, program: s.shell.program, args: s.shell.args, cols: s.ptyCols, rows: s.ptyRows },
+    s.onOutput,
+  )
+    .then(() => {})
+    .catch((err) => {
+      api.log.error(`failed to spawn terminal: ${err}`);
+      s.exited = true;
+      s.tracker.onFatal();
+      if (!ctx.signal.aborted && !s.disposed) {
+        updateStatus(api, ctx, s);
+        notifySessionChanged();
+      }
+    });
+}
+
 async function teardownSession(s: Session) {
+  s.disposed = true;
   s.unlistenOutput?.();
   s.unlistenExit?.();
   s.quietTimer.cancel();
@@ -224,7 +307,9 @@ async function teardownSession(s: Session) {
   // doesn't remove hostDiv itself - without this, a torn-down session's now
   // empty hostDiv is left behind in the pane's container.
   s.hostDiv.remove();
-  s.disposed = true;
+  // A spawn may still be in flight; kill only after it lands, otherwise the
+  // kill hits an unknown id and the shell is orphaned.
+  await s.spawnPromise;
   await ptyKill(s.id).catch(() => {});
 }
 
@@ -327,32 +412,36 @@ export function Component({ api, paneId }: { api: PluginApi; paneId?: string }) 
       container.appendChild(s.hostDiv);
     }
 
-    if (!s.opened) {
+    const wasOpened = s.opened;
+    if (!wasOpened) {
       s.term.open(s.hostDiv);
       s.opened = true;
-      // WebGL is far faster than the DOM renderer for heavy output; if it
-      // can't load (no WebGL2, GPU blocklist) xterm keeps the DOM renderer.
-      try {
-        const webgl = new WebglAddon();
-        webgl.onContextLoss(() => webgl.dispose());
-        s.term.loadAddon(webgl);
-      } catch {
-        // fall back to the DOM renderer
-      }
-    } else {
-      s.fitAddon.fit();
-      s.term.refresh(0, s.term.rows - 1);
+      attachWebgl(s);
     }
 
-    const doFit = () => {
-      s.fitAddon.fit();
+    // ConPTY reflows and the shell redraws on every resize, so PTY resizes are
+    // trailing-debounced and deduped against the size the shell already has.
+    // xterm itself still fits every frame so the pane never looks stretched.
+    let resizeTimer: ReturnType<typeof setTimeout> | undefined;
+    const sendResize = () => {
       const { cols, rows } = s.term;
-      if (cols === s.ptyCols && rows === s.ptyRows) return;
+      if (s.disposed || (cols === s.ptyCols && rows === s.ptyRows)) return;
       s.ptyCols = cols;
       s.ptyRows = rows;
       ptyResize(s.id, cols, rows).catch(() => {});
     };
+    const doFit = () => {
+      s.fitAddon.fit();
+      if (!s.spawnPromise) {
+        // First fit: spawn at the real size (whatever it is) instead of resizing later.
+        if (activeCtx) spawnSession(api, activeCtx, s);
+        return;
+      }
+      clearTimeout(resizeTimer);
+      resizeTimer = setTimeout(sendResize, 100);
+    };
     doFit();
+    if (wasOpened) s.term.refresh(0, s.term.rows - 1);
 
     // Deferred to the next frame: calling doFit() synchronously from inside
     // the ResizeObserver callback resizes the observed element again in the
@@ -388,6 +477,7 @@ export function Component({ api, paneId }: { api: PluginApi; paneId?: string }) 
       window.removeEventListener("blur", onWindowFocusChange);
       ro.disconnect();
       cancelAnimationFrame(rafId);
+      clearTimeout(resizeTimer);
       container.removeEventListener("pointerdown", onFocusLike);
     };
   }, [api, session]);
